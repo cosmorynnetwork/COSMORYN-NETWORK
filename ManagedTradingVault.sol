@@ -21,8 +21,15 @@ contract ManagedTradingVault is AccessControl, Pausable, ReentrancyGuard {
     bytes32 public constant PAUSER_ROLE            = keccak256("PAUSER_ROLE");
 
     IERC20 public immutable cmrToken;
+    IERC20 public usdtToken;
     IPriceOracleAdapter public priceOracle;
     address public reserveTreasury;
+
+    enum AssetType {
+        CMR,
+        USDT,
+        ETH
+    }
 
     // Team bonus basis points across 3 lines: [Line 1, Line 2, Line 3]
     // Default: 800, 400, 300 (8%, 4%, 3% = 15% total)
@@ -31,6 +38,7 @@ contract ManagedTradingVault is AccessControl, Pausable, ReentrancyGuard {
 
     uint256 public minTradingDepositUsd = 50 ether; // $50 USD
     uint256 public fallbackCmrUsdRate = 0.10 ether; // $0.10 USD
+    uint256 public fallbackEthUsdRate = 3500 ether; // $3,500 USD per ETH
     uint256 public constant SLIPPAGE_TOLERANCE_BPS = 100; // 1%
     uint256 public statementExtraCheckFeeCmr = 5 ether; // 5 CMR
 
@@ -50,9 +58,14 @@ contract ManagedTradingVault is AccessControl, Pausable, ReentrancyGuard {
     mapping(uint256 => TradingPosition) public positions;
     mapping(address => uint256[]) public playerPositions;
     mapping(bytes32 => bool) public processedReturnRequestIds;
+    mapping(uint256 => AssetType) public positionAssetType;
+    mapping(uint256 => uint256) public positionNativePrincipal;
+    mapping(uint256 => uint256) public positionNativeReturned;
 
     uint256 public totalActivePrincipalCmr;
     uint256 public totalPrincipalReturnedCmr;
+    uint256 public totalActivePrincipalUsdt;
+    uint256 public totalActivePrincipalEth;
 
     event TradingCapitalDeposited(
         uint256 indexed positionId,
@@ -61,6 +74,16 @@ contract ManagedTradingVault is AccessControl, Pausable, ReentrancyGuard {
         uint256 amountUsd,
         uint256 timestamp
     );
+    event TradingCapitalDepositedAsset(
+        uint256 indexed positionId,
+        address indexed player,
+        AssetType indexed assetType,
+        uint256 nativeAmount,
+        uint256 amountUsd,
+        uint256 timestamp
+    );
+    event UsdtTokenUpdated(address indexed newUsdtToken);
+    event FallbackEthUsdRateUpdated(uint256 newRate);
     event TradingPrincipalReturnRequested(
         uint256 indexed positionId,
         address indexed player,
@@ -151,10 +174,100 @@ contract ManagedTradingVault is AccessControl, Pausable, ReentrancyGuard {
         });
 
         playerPositions[msg.sender].push(positionId);
+        positionAssetType[positionId] = AssetType.CMR;
+        positionNativePrincipal[positionId] = cmrAmount;
         totalActivePrincipalCmr += cmrAmount;
 
         emit TradingCapitalDeposited(positionId, msg.sender, cmrAmount, usdValue, block.timestamp);
+        emit TradingCapitalDepositedAsset(positionId, msg.sender, AssetType.CMR, cmrAmount, usdValue, block.timestamp);
         return positionId;
+    }
+
+    function depositCapitalUsdt(uint256 usdtAmount) external whenNotPaused nonReentrant returns (uint256) {
+        require(reserveTreasury != address(0), "Reserve treasury not configured");
+        require(address(usdtToken) != address(0), "USDT token not configured");
+        require(usdtAmount > 0, "Amount must be > 0");
+
+        // USDT is 6 decimals; convert to 18-decimal USD value
+        uint256 usdValue = usdtAmount * 1e12;
+        require(
+            usdValue * 10000 >= minTradingDepositUsd * (10000 - SLIPPAGE_TOLERANCE_BPS),
+            "Deposit below minimum USD"
+        );
+
+        usdtToken.safeTransferFrom(msg.sender, reserveTreasury, usdtAmount);
+
+        uint256 cmrEquiv = usdToCmr(usdValue);
+        uint256 positionId = nextPositionId++;
+        positions[positionId] = TradingPosition({
+            id: positionId,
+            player: msg.sender,
+            principalCmr: cmrEquiv,
+            principalUsdAtDeposit: usdValue,
+            depositedAt: block.timestamp,
+            principalReturnedCmr: 0,
+            lastReturnedAt: 0,
+            withdrawalRequested: false,
+            active: true
+        });
+
+        playerPositions[msg.sender].push(positionId);
+        positionAssetType[positionId] = AssetType.USDT;
+        positionNativePrincipal[positionId] = usdtAmount;
+        totalActivePrincipalUsdt += usdtAmount;
+
+        emit TradingCapitalDeposited(positionId, msg.sender, cmrEquiv, usdValue, block.timestamp);
+        emit TradingCapitalDepositedAsset(positionId, msg.sender, AssetType.USDT, usdtAmount, usdValue, block.timestamp);
+        return positionId;
+    }
+
+    function depositCapitalEth() external payable whenNotPaused nonReentrant returns (uint256) {
+        require(reserveTreasury != address(0), "Reserve treasury not configured");
+        require(msg.value > 0, "ETH amount must be > 0");
+
+        uint256 usdValue = (msg.value * fallbackEthUsdRate) / 1e18;
+        require(
+            usdValue * 10000 >= minTradingDepositUsd * (10000 - SLIPPAGE_TOLERANCE_BPS),
+            "Deposit below minimum USD"
+        );
+
+        (bool sent, ) = payable(reserveTreasury).call{ value: msg.value }("");
+        require(sent, "ETH forwarding to reserve treasury failed");
+
+        uint256 cmrEquiv = usdToCmr(usdValue);
+        uint256 positionId = nextPositionId++;
+        positions[positionId] = TradingPosition({
+            id: positionId,
+            player: msg.sender,
+            principalCmr: cmrEquiv,
+            principalUsdAtDeposit: usdValue,
+            depositedAt: block.timestamp,
+            principalReturnedCmr: 0,
+            lastReturnedAt: 0,
+            withdrawalRequested: false,
+            active: true
+        });
+
+        playerPositions[msg.sender].push(positionId);
+        positionAssetType[positionId] = AssetType.ETH;
+        positionNativePrincipal[positionId] = msg.value;
+        totalActivePrincipalEth += msg.value;
+
+        emit TradingCapitalDeposited(positionId, msg.sender, cmrEquiv, usdValue, block.timestamp);
+        emit TradingCapitalDepositedAsset(positionId, msg.sender, AssetType.ETH, msg.value, usdValue, block.timestamp);
+        return positionId;
+    }
+
+    function setUsdtToken(IERC20 _usdtToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(address(_usdtToken) != address(0), "Invalid USDT token");
+        usdtToken = _usdtToken;
+        emit UsdtTokenUpdated(address(_usdtToken));
+    }
+
+    function setFallbackEthUsdRate(uint256 _rate) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_rate > 0, "Rate must be > 0");
+        fallbackEthUsdRate = _rate;
+        emit FallbackEthUsdRateUpdated(_rate);
     }
 
     function requestPrincipalReturn(uint256 positionId) external whenNotPaused nonReentrant {

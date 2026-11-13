@@ -21,6 +21,7 @@ contract Marketplace is AccessControl, Pausable, ReentrancyGuard {
 
     IERC1155 public immutable nftContract;
     IERC20 public immutable cmrToken;
+    IERC20 public usdtToken;
     address public treasury;
 
     // Marketplace fee in basis points (250 = 2.5%)
@@ -66,6 +67,7 @@ contract Marketplace is AccessControl, Pausable, ReentrancyGuard {
     event ItemDelisted(uint256 indexed listingId, string reason);
     event FeeUpdated(uint256 newFeeBps);
     event TreasuryUpdated(address indexed newTreasury);
+    event UsdtTokenUpdated(address indexed newUsdtToken);
     event SellerProceedsHeld(address indexed seller, uint256 amount);
     event ProceedsWithdrawn(address indexed seller, uint256 amount);
 
@@ -98,7 +100,12 @@ contract Marketplace is AccessControl, Pausable, ReentrancyGuard {
     ) external whenNotPaused nonReentrant returns (uint256) {
         require(amount > 0, "Amount must be > 0");
         require(pricePerUnit > 0, "Price must be > 0");
-        require(paymentToken == address(0) || paymentToken == address(cmrToken), "Unsupported payment token");
+        require(
+            paymentToken == address(0) ||
+            paymentToken == address(cmrToken) ||
+            (address(usdtToken) != address(0) && paymentToken == address(usdtToken)),
+            "Unsupported payment token"
+        );
         require(durationSeconds > 0 && durationSeconds <= 90 days, "Invalid duration");
         require(
             nftContract.balanceOf(msg.sender, tokenId) >= activeListedAmount[msg.sender][tokenId] + amount,
@@ -238,13 +245,14 @@ contract Marketplace is AccessControl, Pausable, ReentrancyGuard {
                 require(refundSent, "ETH refund failed");
             }
         } else {
-            // Payment in CMR Token
+            // Payment in ERC20 Token (CMR or USDT)
             require(msg.value == 0, "ETH not accepted for token listing");
-            cmrToken.safeTransferFrom(msg.sender, treasury, fee);
+            IERC20 token = IERC20(paymentToken);
+            token.safeTransferFrom(msg.sender, treasury, fee);
             if (royaltyAmount > 0 && royaltyReceiver != address(0)) {
-                cmrToken.safeTransferFrom(msg.sender, royaltyReceiver, royaltyAmount);
+                token.safeTransferFrom(msg.sender, royaltyReceiver, royaltyAmount);
             }
-            cmrToken.safeTransferFrom(msg.sender, seller, sellerProceeds);
+            token.safeTransferFrom(msg.sender, seller, sellerProceeds);
         }
     }
 
@@ -326,6 +334,12 @@ contract Marketplace is AccessControl, Pausable, ReentrancyGuard {
         require(_treasury != address(0), "Invalid treasury");
         treasury = _treasury;
         emit TreasuryUpdated(_treasury);
+    }
+
+    function setUsdtToken(IERC20 _usdtToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(address(_usdtToken) != address(0), "Invalid USDT token");
+        usdtToken = _usdtToken;
+        emit UsdtTokenUpdated(address(_usdtToken));
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {

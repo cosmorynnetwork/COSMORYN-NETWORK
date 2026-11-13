@@ -85,6 +85,28 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
     uint256 public totalRewardPool;
     uint256 public totalGiftCreditBackingPool;
 
+    // ── Global 90-Day 50% Staking Discount Config ────────────────────
+    bool public discountPromoEnabled;
+    uint256 public discountPromoBps = 5000; // Default 50%
+    uint256 public discountPromoStartTime;
+    uint256 public discountPromoEndTime;
+
+    // ── Global 30-Day 2X System Asset Doubler & Mandatory 90-Day Staking ──
+    bool public doublerPromoEnabled;
+    uint256 public doublerMultiplierBps = 20000; // Default 2.0x (200%)
+    uint256 public doublerPromoStartTime;
+    uint256 public doublerPromoEndTime;
+    uint256 public doublerMandatoryTierIndex = 2; // Default Tier 2 = 90 Days
+    bool public releaseMatchedPrincipalAtMaturity = true;
+
+    mapping(uint256 => bool) public isPromoLockedPosition;
+    mapping(uint256 => uint256) public positionMatchedBonus;
+    mapping(uint256 => uint256) public positionBaseContributed;
+
+    bytes32 private constant DOUBLER_SWEEP_TYPEHASH = keccak256(
+        "DoublerSweep(address player,uint256 baseEarnedAmount,uint256 tierIndex,bool autoCompound,bytes32 sweepRefId,uint256 deadline)"
+    );
+
     event Staked(
         uint256 indexed positionId,
         address indexed player,
@@ -127,6 +149,32 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
     event PenaltyReceiverUpdated(address indexed newReceiver);
     event GiftCreditPoolFunded(address indexed funder, uint256 amount);
     event GiftCreditStaked(bytes32 indexed creditRefId, uint256 indexed positionId, address indexed player, uint256 amount);
+    event StakingDiscountPromoUpdated(bool enabled, uint256 discountBps, uint256 startTime, uint256 endTime);
+    event SystemAssetDoublerPromoUpdated(
+        bool enabled,
+        uint256 multiplierBps,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 mandatoryTierIndex,
+        bool releaseMatchedPrincipalAtMaturity
+    );
+    event PromoDiscountStaked(
+        uint256 indexed positionId,
+        address indexed player,
+        uint256 userPaidAmount,
+        uint256 matchedBonusAmount,
+        uint256 totalStakedAmount,
+        uint256 tierIndex
+    );
+    event SystemAssetsDoubledAndStaked(
+        bytes32 indexed sweepRefId,
+        uint256 indexed positionId,
+        address indexed player,
+        uint256 baseEarnedAmount,
+        uint256 matchedBonusAmount,
+        uint256 totalStakedAmount,
+        uint256 tierIndex
+    );
 
     constructor(IERC20 _cmrToken, address admin) {
         require(address(_cmrToken) != address(0), "Invalid token");
@@ -259,14 +307,77 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
         return fallbackCmrUsdRate;
     }
 
-    function getMinStakeCmr(uint256 tierIndex) public view returns (uint256) {
+    function isDiscountPromoActive() public view returns (bool) {
+        if (!discountPromoEnabled || discountPromoBps == 0) return false;
+        if (discountPromoStartTime > 0 && block.timestamp < discountPromoStartTime) return false;
+        if (discountPromoEndTime > 0 && block.timestamp > discountPromoEndTime) return false;
+        return true;
+    }
+
+    function isDoublerPromoActive() public view returns (bool) {
+        if (!doublerPromoEnabled || doublerMultiplierBps < 10000) return false;
+        if (doublerPromoStartTime > 0 && block.timestamp < doublerPromoStartTime) return false;
+        if (doublerPromoEndTime > 0 && block.timestamp > doublerPromoEndTime) return false;
+        return true;
+    }
+
+    function getEffectiveMinStakeUsd(uint256 tierIndex) public view returns (uint256) {
         require(tierIndex < lockTiers.length, "Invalid tier index");
-        uint256 effectiveMinUsd = lockTiers[tierIndex].tierMinStakeUsd > 0
+        uint256 baseMinUsd = lockTiers[tierIndex].tierMinStakeUsd > 0
             ? lockTiers[tierIndex].tierMinStakeUsd
             : minStakeUsd;
+        if (isDiscountPromoActive() && discountPromoBps < 10000) {
+            return (baseMinUsd * (10000 - discountPromoBps)) / 10000;
+        }
+        return baseMinUsd;
+    }
+
+    function getMinStakeCmr(uint256 tierIndex) public view returns (uint256) {
+        uint256 effectiveMinUsd = getEffectiveMinStakeUsd(tierIndex);
         uint256 price = getCmrUsdPrice();
         require(price > 0, "Invalid oracle price");
         return (effectiveMinUsd * 1e18) / price;
+    }
+
+    function setStakingDiscountPromo(
+        bool _enabled,
+        uint256 _discountBps,
+        uint256 _startTime,
+        uint256 _endTime
+    ) external onlyRole(STAKING_MANAGER_ROLE) {
+        require(_discountBps <= 9000, "Discount cannot exceed 90%");
+        discountPromoEnabled = _enabled;
+        discountPromoBps = _discountBps;
+        discountPromoStartTime = _startTime;
+        discountPromoEndTime = _endTime;
+        emit StakingDiscountPromoUpdated(_enabled, _discountBps, _startTime, _endTime);
+    }
+
+    function setSystemAssetDoublerPromo(
+        bool _enabled,
+        uint256 _multiplierBps,
+        uint256 _startTime,
+        uint256 _endTime,
+        uint256 _mandatoryTierIndex,
+        bool _releaseMatchedAtMaturity
+    ) external onlyRole(STAKING_MANAGER_ROLE) {
+        require(_multiplierBps >= 10000 && _multiplierBps <= 50000, "Multiplier must be 1.0x to 5.0x");
+        require(_mandatoryTierIndex < lockTiers.length, "Invalid mandatory tier index");
+        require(lockTiers[_mandatoryTierIndex].durationDays > 0, "Mandatory tier must have lock duration");
+        doublerPromoEnabled = _enabled;
+        doublerMultiplierBps = _multiplierBps;
+        doublerPromoStartTime = _startTime;
+        doublerPromoEndTime = _endTime;
+        doublerMandatoryTierIndex = _mandatoryTierIndex;
+        releaseMatchedPrincipalAtMaturity = _releaseMatchedAtMaturity;
+        emit SystemAssetDoublerPromoUpdated(
+            _enabled,
+            _multiplierBps,
+            _startTime,
+            _endTime,
+            _mandatoryTierIndex,
+            _releaseMatchedAtMaturity
+        );
     }
 
     function fundRewardPool(uint256 amount) external {
@@ -353,12 +464,103 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
         return posId;
     }
 
+    function stakeWithPromoDiscount(
+        uint256 userPayAmount,
+        uint256 tierIndex,
+        bool autoCompound
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(isDiscountPromoActive(), "Staking discount promo is not active");
+        require(userPayAmount > 0, "Amount must be > 0");
+        require(tierIndex < lockTiers.length, "Invalid tier index");
+        LockTier memory tier = lockTiers[tierIndex];
+        require(tier.active, "Tier inactive");
+        require(tier.durationDays > 0, "Discounted stake must use locked tier");
+
+        uint256 totalAmount = (userPayAmount * 10000) / (10000 - discountPromoBps);
+        uint256 matchedBonus = totalAmount - userPayAmount;
+        require(totalGiftCreditBackingPool >= matchedBonus, "Insufficient promo backing pool");
+
+        totalGiftCreditBackingPool -= matchedBonus;
+        cmrToken.safeTransferFrom(msg.sender, address(this), userPayAmount);
+
+        uint256 posId = _createStake(msg.sender, totalAmount, tierIndex, autoCompound, true);
+        isPromoLockedPosition[posId] = true;
+        positionMatchedBonus[posId] = matchedBonus;
+        positionBaseContributed[posId] = userPayAmount;
+
+        emit PromoDiscountStaked(posId, msg.sender, userPayAmount, matchedBonus, totalAmount, tierIndex);
+        return posId;
+    }
+
+    function stakeDoubledSystemAssets(
+        address player,
+        uint256 baseEarnedAmount,
+        bool autoCompound,
+        bytes32 sweepRefId,
+        uint256 deadline,
+        bytes calldata signature
+    ) external whenNotPaused nonReentrant returns (uint256) {
+        require(doublerPromoEnabled, "System asset doubler promo disabled");
+        require(player != address(0), "Invalid player");
+        require(block.timestamp <= deadline, "Sweep voucher expired");
+        require(!usedCreditRefs[sweepRefId], "Sweep ref already used");
+        require(baseEarnedAmount > 0, "Base amount must be > 0");
+
+        uint256 tierIndex = doublerMandatoryTierIndex;
+        require(tierIndex < lockTiers.length, "Invalid mandatory tier");
+        LockTier memory tier = lockTiers[tierIndex];
+        require(tier.active && tier.durationDays > 0, "Mandatory tier inactive");
+
+        if (!hasRole(CREDIT_ISSUER_ROLE, msg.sender)) {
+            bytes32 structHash = keccak256(
+                abi.encode(DOUBLER_SWEEP_TYPEHASH, player, baseEarnedAmount, tierIndex, autoCompound, sweepRefId, deadline)
+            );
+            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+            address signer = ECDSA.recover(digest, signature);
+            require(hasRole(CREDIT_ISSUER_ROLE, signer), "Invalid sweep issuer signature");
+        }
+
+        uint256 totalDoubledAmount = (baseEarnedAmount * doublerMultiplierBps) / 10000;
+        uint256 matchedBonus = totalDoubledAmount - baseEarnedAmount;
+        require(totalGiftCreditBackingPool >= totalDoubledAmount, "Insufficient backing pool for doubled assets");
+
+        usedCreditRefs[sweepRefId] = true;
+        totalGiftCreditBackingPool -= totalDoubledAmount;
+
+        uint256 posId = _createStakeInternal(player, totalDoubledAmount, tierIndex, autoCompound, true, true);
+        isPromoLockedPosition[posId] = true;
+        positionMatchedBonus[posId] = matchedBonus;
+        positionBaseContributed[posId] = baseEarnedAmount;
+
+        emit SystemAssetsDoubledAndStaked(
+            sweepRefId,
+            posId,
+            player,
+            baseEarnedAmount,
+            matchedBonus,
+            totalDoubledAmount,
+            tierIndex
+        );
+        return posId;
+    }
+
     function _createStake(
         address player,
         uint256 amount,
         uint256 tierIndex,
         bool autoCompound,
         bool isGiftCreditFunded
+    ) internal returns (uint256) {
+        return _createStakeInternal(player, amount, tierIndex, autoCompound, isGiftCreditFunded, false);
+    }
+
+    function _createStakeInternal(
+        address player,
+        uint256 amount,
+        uint256 tierIndex,
+        bool autoCompound,
+        bool isGiftCreditFunded,
+        bool skipMinUsdCheck
     ) internal returns (uint256) {
         require(amount > 0, "Amount must be > 0");
         require(tierIndex < lockTiers.length, "Invalid tier index");
@@ -370,8 +572,8 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
         }
 
         // USD minimum enforcement with 1% slippage margin
-        uint256 effectiveMinUsd = tier.tierMinStakeUsd > 0 ? tier.tierMinStakeUsd : minStakeUsd;
-        if (effectiveMinUsd > 0) {
+        uint256 effectiveMinUsd = getEffectiveMinStakeUsd(tierIndex);
+        if (!skipMinUsdCheck && effectiveMinUsd > 0) {
             uint256 price = getCmrUsdPrice();
             uint256 stakeUsdValue = (amount * price) / 1e18;
             require(
@@ -510,16 +712,23 @@ contract Staking is AccessControl, Pausable, ReentrancyGuard {
         totalStakedAmount -= stakedAmount;
         totalRewardPool -= reward;
 
-        cmrToken.safeTransfer(msg.sender, stakedAmount + reward);
+        uint256 principalToRelease = stakedAmount;
+        uint256 matchedBonus = positionMatchedBonus[positionId];
+        if (!releaseMatchedPrincipalAtMaturity && matchedBonus > 0 && stakedAmount >= matchedBonus) {
+            principalToRelease = stakedAmount - matchedBonus;
+            totalGiftCreditBackingPool += matchedBonus;
+        }
 
-        emit Unstaked(positionId, msg.sender, stakedAmount, reward);
+        cmrToken.safeTransfer(msg.sender, principalToRelease + reward);
+
+        emit Unstaked(positionId, msg.sender, principalToRelease, reward);
     }
 
     function earlyUnstake(uint256 positionId) external nonReentrant {
         StakePosition storage pos = positions[positionId];
         require(pos.player == msg.sender, "Not position owner");
         require(pos.active, "Position inactive");
-        require(!pos.isGiftCreditFunded, "Gift-funded stake must complete lock period");
+        require(!pos.isGiftCreditFunded && !isPromoLockedPosition[positionId], "Gift-funded stake must complete lock period");
         require(block.timestamp < pos.unlocksAt, "Use regular unstake after unlock");
 
         LockTier memory tier = lockTiers[pos.tierIndex];

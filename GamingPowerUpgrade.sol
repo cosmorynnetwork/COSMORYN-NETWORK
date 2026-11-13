@@ -19,6 +19,7 @@ contract GamingPowerUpgrade is AccessControl, Pausable, ReentrancyGuard {
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     IERC20 public immutable cmrToken;
+    IERC20 public usdtToken;
     address public treasury;
 
     // Rate: 1 CMR = X USD (in 18 decimals, e.g., 0.10 USD = 10^17)
@@ -67,6 +68,7 @@ contract GamingPowerUpgrade is AccessControl, Pausable, ReentrancyGuard {
     event TierConfigUpdated(PowerTier indexed tier, uint256 priceUsd, uint256 multiplierBps, bool active);
     event RatesUpdated(uint256 cmrUsdRate, uint256 ethUsdRate);
     event TreasuryUpdated(address indexed newTreasury);
+    event UsdtTokenUpdated(address indexed newUsdtToken);
 
     constructor(
         IERC20 _cmrToken,
@@ -116,6 +118,33 @@ contract GamingPowerUpgrade is AccessControl, Pausable, ReentrancyGuard {
         cmrToken.safeTransferFrom(msg.sender, treasury, costCmr);
 
         emit PowerUpgraded(msg.sender, targetTier, config.multiplierBps, costCmr, address(cmrToken), block.timestamp);
+    }
+
+    function upgradeTierWithUSDT(PowerTier targetTier) external whenNotPaused nonReentrant {
+        require(address(usdtToken) != address(0), "USDT token not configured");
+        require(uint8(targetTier) > uint8(playerPowers[msg.sender].tier), "Target tier must be higher");
+        TierConfig memory config = tierConfigs[targetTier];
+        require(config.active, "Tier is inactive");
+
+        // priceUsd is 18 decimals; USDT is 6 decimals (1 USD = 1e6 units)
+        uint256 costUsdt = config.priceUsd / 1e12;
+        require(costUsdt > 0, "Invalid USDT calculation");
+
+        playerPowers[msg.sender] = PlayerPower({
+            tier: targetTier,
+            multiplierBps: config.multiplierBps,
+            upgradedAt: block.timestamp
+        });
+
+        usdtToken.safeTransferFrom(msg.sender, treasury, costUsdt);
+
+        emit PowerUpgraded(msg.sender, targetTier, config.multiplierBps, costUsdt, address(usdtToken), block.timestamp);
+    }
+
+    function setUsdtToken(IERC20 _usdtToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(address(_usdtToken) != address(0), "Invalid USDT token");
+        usdtToken = _usdtToken;
+        emit UsdtTokenUpdated(address(_usdtToken));
     }
 
     function upgradeTierWithETH(PowerTier targetTier) public payable whenNotPaused nonReentrant {
